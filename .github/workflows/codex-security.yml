@@ -106,6 +106,7 @@ jobs:
             ['OutputDirectoryNotEmptyError', 'output directory is not empty'],
             ['OutputInsideProtectedRootError', 'output or state directory overlaps the scan target'],
             ['ContractValidationError', 'scanner output did not pass validation'],
+            ['ZodError', 'scanner response did not match the expected schema'],
             ['IncompleteScanError', 'scanner did not produce a complete result'],
             ['ScanInterruptedError', 'scan interrupted'],
             ['ERR_MODULE_NOT_FOUND', 'required module not found'],
@@ -114,10 +115,15 @@ jobs:
             ['ETIMEDOUT', 'operation timed out'],
           ]);
           const httpCategories = new Map([
+            [400, 'HTTP 400: invalid request'],
             [401, 'HTTP 401: authentication rejected'],
             [403, 'HTTP 403: access denied'],
             [404, 'HTTP 404: requested resource not found'],
             [429, 'HTTP 429: rate or quota limit'],
+            [500, 'HTTP 500: upstream service error'],
+            [502, 'HTTP 502: upstream gateway error'],
+            [503, 'HTTP 503: upstream service unavailable'],
+            [504, 'HTTP 504: upstream gateway timeout'],
           ]);
           // Some SDK and app-server failures wrap details in text, not a status field.
           // Match known patterns, but never publish the text or any captured value.
@@ -127,28 +133,40 @@ jobs:
             [/^The Codex Security workbench returned invalid JSON\./u, 'Codex Security workbench returned invalid JSON'],
             [/^The Codex Security workbench returned an invalid scan registration\./u, 'Codex Security workbench returned an invalid registration response'],
             [/^The Codex Security scan turn failed without a readable error message\./u, 'Codex scan turn failed without a readable error'],
+            [/^The custom validation turn did not complete\./u, 'custom validation turn did not complete'],
+            [/\b(?:context_length_exceeded|context_window_exceeded)\b/u, 'scan runtime context limit exceeded'],
+            [/\b(?:invalid_request_error|unsupported_parameter)\b/u, 'scan runtime request rejected'],
             [/\b(?:invalid_api_key|authentication_error)\b/u, 'scan runtime authentication rejected'],
             [/\b(?:model_not_found|unsupported_model)\b/u, 'scan runtime model unavailable'],
+            [/\b(?:permission_denied|insufficient_permissions)\b/u, 'scan runtime access denied'],
             [/\b(?:insufficient_quota|rate_limit_exceeded)\b/u, 'scan runtime rate or quota limit'],
+            [/\b(?:server_error|service_unavailable)\b/u, 'scan runtime upstream service error'],
           ];
           const reportFailure = (stage, error, context = '') => {
             let reason;
+            let errorCategory;
+            let turnFailed = false;
             for (let cause = error, depth = 0; cause && depth < 5; cause = cause.cause, depth++) {
               const message = typeof cause === 'string' ? cause : cause.message;
               const nativeStatus = typeof message === 'string'
-                ? /(?:^|\n)(?:Error: )?unexpected status (401|403|404|429)\b/u.exec(message)?.[1]
+                ? /(?:^|\n)(?:Error: )?unexpected status (\d{3})\b/u.exec(message)?.[1]
                 : undefined;
-              const httpReason = httpCategories.get(cause.status ?? cause.statusCode ?? cause.response?.status ?? Number(nativeStatus));
+              const httpReason = httpCategories.get(Number(cause.status ?? cause.statusCode ?? cause.response?.status))
+                ?? httpCategories.get(Number(nativeStatus));
               if (httpReason) {
                 reason = httpReason;
                 break;
               }
-              reason ??= errorCategories.get(cause.name) ?? errorCategories.get(cause.code);
-              if (reason === undefined && typeof message === 'string') {
-                reason = messageCategories.find(([pattern]) => pattern.test(message))?.[1];
-              }
+              errorCategory ??= errorCategories.get(cause.name) ?? errorCategories.get(cause.code);
+              // The pinned SDK wraps failed Codex turns via this function and preserves the cause.
+              turnFailed ||= typeof cause.stack === 'string' && /^\s+at codexTurnError \(/mu.test(cause.stack);
+              reason ??= messageCategories.find(([pattern]) => [cause.code, message].some(
+                (value) => typeof value === 'string' && pattern.test(value),
+              ))?.[1];
             }
-            annotate('error', `Codex Security failed during ${stage}: ${reason ?? 'no safe diagnostic available'}.${context}`);
+            reason ??= errorCategory;
+            const summary = reason ?? (turnFailed ? 'Codex turn failed without a recognized error category' : 'no safe diagnostic available');
+            annotate('error', `Codex Security failed during ${stage}: ${summary}.${context}`);
             process.exitCode = 1;
             return reason !== undefined;
           };
@@ -188,10 +206,13 @@ jobs:
           let model;
           let stage = 'SDK initialization';
           let scanMilestone = 'none reported';
+          let scanPhase;
+          let reconnectReason;
           let trustedAccess;
+          const phases = new Set(['preflight', 'threat_model', 'discovery', 'validation', 'attack_path', 'reporting']);
+          const reconnectReasons = new Set(['rate_limit', 'network', 'authentication', 'authorization']);
           try {
-            const { CodexSecurity, DEFAULT_CODEX_CONFIG } = await import('@openai/codex-security');
-            model = DEFAULT_CODEX_CONFIG.model;
+            const { CodexSecurity } = await import('@openai/codex-security');
             security = new CodexSecurity({
               codexOverrides: {
                 approval_policy: 'never',
@@ -200,7 +221,8 @@ jobs:
             });
             // Preflight checks local inputs only; live authentication is checked by run().
             stage = 'local preflight';
-            await security.preflight(process.env.GITHUB_WORKSPACE, { ...options, auth: 'auto' });
+            const preflight = await security.preflight(process.env.GITHUB_WORKSPACE, { ...options, auth: 'auto' });
+            model = preflight.model;
             summarize('Codex Security: local preflight passed for `src`; OpenAI API access was not tested by preflight.');
 
             if (runScan) {
@@ -213,6 +235,12 @@ jobs:
                   if (snapshot.status === 'running') scanMilestone = 'scan registered';
                 },
                 onScanStarted() { scanMilestone = 'scan session started'; },
+                onProgress({ phase }) {
+                  if (phases.has(phase)) scanPhase = phase;
+                },
+                onReconnect(_attempt, _maxAttempts, details) {
+                  if (reconnectReasons.has(details?.reason)) reconnectReason = details.reason;
+                },
                 onTrustedAccessStatus(status) {
                   if (status === 'granted' || status === 'not_granted' || status === 'unknown') {
                     trustedAccess = status;
@@ -231,7 +259,12 @@ jobs:
             }
           } catch (error) {
             const context = stage === 'live scan'
-              ? ` Last SDK milestone: ${scanMilestone}.${trustedAccess ? ` Trusted Access: ${trustedAccess}.` : ''}`
+              ? [
+                  ` Last SDK milestone: ${scanMilestone}.`,
+                  scanPhase && ` Last scan phase: ${scanPhase}.`,
+                  reconnectReason && ` Last reconnect reason: ${reconnectReason}.`,
+                  trustedAccess && ` Trusted Access: ${trustedAccess}.`,
+                ].filter(Boolean).join('')
               : '';
             const hasDiagnostic = reportFailure(stage, error, context);
             if (stage === 'live scan' && !hasDiagnostic && model) {
