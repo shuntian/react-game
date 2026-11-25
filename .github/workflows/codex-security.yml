@@ -40,7 +40,8 @@ jobs:
 
       - name: Show report in logs and Job Summary
         run: |
-          REPORT="$(find "$CODEX_SECURITY_STATE_DIR" -type f -name report.md -print -quit)"
+          mkdir -p "$CODEX_SECURITY_STATE_DIR"
+          REPORT="$(find "$CODEX_SECURITY_STATE_DIR" -type f -name report.md -print -quit 2>/dev/null)"
           if [ ! -s "$REPORT" ]; then
             echo "::warning::未找到 report.md，扫描结果目录可能为空" | tee -a "$GITHUB_STEP_SUMMARY"
             exit 1
