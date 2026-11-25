@@ -38,21 +38,6 @@ jobs:
             --no-save --no-package-lock --ignore-scripts --no-audit --no-fund \
             @openai/codex-security@0.10.1
 
-      - name: Prepare the Codex sandbox
-        working-directory: ${{ runner.temp }}/codex-security
-        run: |
-          codex="$(node --input-type=module -e 'import { resolveCodexCommand } from "@openai/codex-security"; console.log(resolveCodexCommand().command)')"
-          if ! timeout 30s "$codex" sandbox -- "$codex" --version; then
-            sudo apt-get update
-            sudo apt-get install --yes bubblewrap apparmor-profiles
-            profile=/usr/share/apparmor/extra-profiles/bwrap-userns-restrict
-            if [ ! -f "$profile" ]; then
-              profile=/etc/apparmor.d/bwrap-userns-restrict
-            fi
-            sudo apparmor_parser -r "$profile"
-            timeout 30s "$codex" sandbox -- "$codex" --version
-          fi
-
       - name: Run Codex Security scan
         env:
           CODEX_SECURITY_STATE_DIR: ${{ runner.temp }}/codex-security-state
