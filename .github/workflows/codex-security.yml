@@ -142,7 +142,35 @@ jobs:
             [/\b(?:insufficient_quota|rate_limit_exceeded)\b/u, 'scan runtime rate or quota limit'],
             [/\b(?:server_error|service_unavailable)\b/u, 'scan runtime upstream service error'],
           ];
-          const reportFailure = (stage, error, context = '') => {
+          const sessionErrorCategories = new Map([
+            ['context_window_exceeded', 'scan runtime context limit exceeded'],
+            ['session_budget_exceeded', 'scan session budget exceeded'],
+            ['usage_limit_exceeded', 'scan runtime usage limit exceeded'],
+            ['rate_limit_exceeded', 'scan runtime rate limit exceeded'],
+            ['server_overloaded', 'scan runtime service overloaded'],
+            ['model_not_found', 'scan runtime model unavailable'],
+            ['policy_capacity_unavailable', 'scan runtime policy-restricted route unavailable'],
+            ['cyber_policy', 'scan request blocked by the cybersecurity policy'],
+            ['misalignment_policy_violation', 'scan request blocked by a safety policy'],
+            ['internal_server_error', 'scan runtime upstream service error'],
+            ['unauthorized', 'scan runtime authentication rejected'],
+            ['bad_request', 'scan runtime request rejected'],
+            ['invalid_prompt', 'scan runtime rejected the prompt'],
+            ['sandbox_error', 'scan runtime sandbox error'],
+            ['http_connection_failed', 'scan runtime HTTP connection failed'],
+            ['response_stream_connection_failed', 'scan runtime could not connect to the response stream'],
+            ['response_stream_disconnected', 'scan runtime response stream disconnected'],
+            ['response_too_many_failed_attempts', 'scan runtime exhausted response retries'],
+          ]);
+          // Classify Codex rollout events without copying messages or IDs to the Summary.
+          const sessionErrorCategory = (error) => {
+            const info = error?.codex_error_info;
+            const kind = typeof info === 'string' ? info : Object.keys(info ?? {})[0];
+            const category = sessionErrorCategories.get(kind);
+            const httpReason = httpCategories.get(info?.[kind]?.http_status_code);
+            return category && (httpReason ? `${category} (${httpReason})` : category);
+          };
+          const reportFailure = (stage, error, context = '', sessionReason) => {
             let reason;
             let errorCategory;
             let turnFailed = false;
@@ -164,33 +192,37 @@ jobs:
                 (value) => typeof value === 'string' && pattern.test(value),
               ))?.[1];
             }
-            reason ??= errorCategory;
+            reason ??= sessionReason ?? errorCategory;
             const summary = reason ?? (turnFailed ? 'Codex turn failed without a recognized error category' : 'no safe diagnostic available');
             annotate('error', `Codex Security failed during ${stage}: ${summary}.${context}`);
             process.exitCode = 1;
             return reason !== undefined;
           };
-          const probeOpenAI = async (model) => {
+          const probeOpenAI = async ({ model, reasoningEffort }, reasoningSummary) => {
             let status;
+            let outcome;
             try {
+              const reasoning = { effort: reasoningEffort };
+              if (reasoningSummary && reasoningSummary !== 'none') reasoning.summary = reasoningSummary;
               const response = await fetch('https://api.openai.com/v1/responses', {
                 method: 'POST',
                 headers: {
                   'Authorization': `Bearer ${process.env.OPENAI_API_KEY.trim()}`,
                   'Content-Type': 'application/json',
                 },
-                body: JSON.stringify({ model, input: 'Reply with OK.', max_output_tokens: 16, store: false }),
+                body: JSON.stringify({ model, reasoning, input: 'Reply with OK.', max_output_tokens: 512, store: false }),
                 redirect: 'error',
-                signal: AbortSignal.timeout(15000),
+                signal: AbortSignal.timeout(30000),
               });
               status = response.status;
-              await response.body?.cancel().catch(() => {});
+              const body = await response.json().catch(() => null);
+              if (['completed', 'failed', 'incomplete'].includes(body?.status)) outcome = body.status;
             } catch (error) {
               const reason = error?.name === 'TimeoutError' ? 'timed out' : 'no HTTP response';
               annotate('warning', `Source-free OpenAI API probe: ${reason}.`);
               return;
             }
-            annotate('notice', `Source-free OpenAI API probe: HTTP ${status}.`);
+            annotate('notice', `Source-free OpenAI API probe with scan reasoning settings: HTTP ${status}${outcome ? `, response ${outcome}` : ''}.`);
           };
 
           const options = {
@@ -203,16 +235,19 @@ jobs:
           };
 
           let security;
-          let model;
+          let preflight;
+          let reasoningSummary;
           let stage = 'SDK initialization';
           let scanMilestone = 'none reported';
           let scanPhase;
           let reconnectReason;
           let trustedAccess;
+          let sessionReason;
           const phases = new Set(['preflight', 'threat_model', 'discovery', 'validation', 'attack_path', 'reporting']);
           const reconnectReasons = new Set(['rate_limit', 'network', 'authentication', 'authorization']);
           try {
-            const { CodexSecurity } = await import('@openai/codex-security');
+            const { CodexSecurity, DEFAULT_CODEX_CONFIG } = await import('@openai/codex-security');
+            reasoningSummary = DEFAULT_CODEX_CONFIG.model_reasoning_summary;
             security = new CodexSecurity({
               codexOverrides: {
                 approval_policy: 'never',
@@ -221,8 +256,7 @@ jobs:
             });
             // Preflight checks local inputs only; live authentication is checked by run().
             stage = 'local preflight';
-            const preflight = await security.preflight(process.env.GITHUB_WORKSPACE, { ...options, auth: 'auto' });
-            model = preflight.model;
+            preflight = await security.preflight(process.env.GITHUB_WORKSPACE, { ...options, auth: 'auto' });
             summarize('Codex Security: local preflight passed for `src`; OpenAI API access was not tested by preflight.');
 
             if (runScan) {
@@ -237,6 +271,15 @@ jobs:
                 onScanStarted() { scanMilestone = 'scan session started'; },
                 onProgress({ phase }) {
                   if (phases.has(phase)) scanPhase = phase;
+                },
+                onSessionEvent({ parentThreadId, event }) {
+                  if (parentThreadId !== null || event.type !== 'event_msg') return;
+                  const payload = event.payload;
+                  if (payload?.type === 'task_started') sessionReason = undefined;
+                  if (payload?.type === 'error') sessionReason = sessionErrorCategory(payload) ?? sessionReason;
+                  if (payload?.type === 'task_complete') {
+                    sessionReason = payload.error ? sessionErrorCategory(payload.error) ?? sessionReason : undefined;
+                  }
                 },
                 onReconnect(_attempt, _maxAttempts, details) {
                   if (reconnectReasons.has(details?.reason)) reconnectReason = details.reason;
@@ -266,9 +309,9 @@ jobs:
                   trustedAccess && ` Trusted Access: ${trustedAccess}.`,
                 ].filter(Boolean).join('')
               : '';
-            const hasDiagnostic = reportFailure(stage, error, context);
-            if (stage === 'live scan' && !hasDiagnostic && model) {
-              await probeOpenAI(model);
+            const hasDiagnostic = reportFailure(stage, error, context, sessionReason);
+            if (stage === 'live scan' && !hasDiagnostic && preflight?.model) {
+              await probeOpenAI(preflight, reasoningSummary);
             }
           } finally {
             try {
