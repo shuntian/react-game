@@ -29,6 +29,7 @@ jobs:
         with:
           scope: repository
           mode: standard
+          model: gpt-6.2-sol
           fail-on-severity: none
           verbose: 'false'
           annotations: 'false'
