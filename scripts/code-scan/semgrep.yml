@@ -1,0 +1,22 @@
+rules:
+  - id: js-eval
+    severity: ERROR
+    message: 检查 eval 的输入是否可能来自不可信来源。
+    languages: [javascript, typescript]
+    pattern: eval(...)
+
+  - id: js-raw-html
+    severity: WARNING
+    message: 检查写入 DOM 或 React 的 HTML 是否经过可靠净化。
+    languages: [javascript, typescript]
+    pattern-either:
+      - pattern: $TARGET.innerHTML = $HTML
+      - pattern: document.write(...)
+      - pattern-regex: '\bdangerouslySetInnerHTML\s*='
+
+  - id: js-hardcoded-secret
+    severity: ERROR
+    message: 检查疑似硬编码的凭据是否应从配置读取。
+    languages: [javascript, typescript]
+    pattern-regex: >-
+      (?i)\b(password|passwd|secret|api[_-]?key|token)\s*=\s*["'][^"']{8,}["']

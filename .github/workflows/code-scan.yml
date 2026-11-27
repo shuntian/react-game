@@ -1,0 +1,62 @@
+name: Independent Code Scan
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  schedule:
+    - cron: "0 3 * * 1" # 每周一 11:00，北京时间
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Node
+        uses: actions/setup-node@6044e13b5dc448c55e2357c09f80417699197238 # v6.2.0
+        with:
+          node-version: "24"
+          package-manager-cache: false
+
+      - name: Set up Semgrep CE
+        run: |
+          python3 -m venv "$RUNNER_TEMP/semgrep-venv"
+          "$RUNNER_TEMP/semgrep-venv/bin/python" -m pip install --only-binary=:all: 'semgrep==1.156.0'
+          echo "$RUNNER_TEMP/semgrep-venv/bin" >> "$GITHUB_PATH"
+
+      - name: Set up Gitleaks
+        working-directory: ${{ runner.temp }}
+        run: |
+          mkdir -p gitleaks-bin
+          archive=gitleaks_8.30.0_linux_x64.tar.gz
+          curl --fail --silent --show-error --location --retry 3 --output "$archive" \
+            "https://github.com/gitleaks/gitleaks/releases/download/v8.30.0/$archive"
+          printf '%s  %s\n' '79a3ab579b53f71efd634f3aaf7e04a0fa0cf206b7ed434638d1547a2470a66e' "$archive" | sha256sum --check
+          tar -xzf "$archive" -C gitleaks-bin gitleaks
+          echo "$RUNNER_TEMP/gitleaks-bin" >> "$GITHUB_PATH"
+
+      - name: Run security checks
+        id: scan
+        run: python3 scripts/code-scan/scan.py --output-dir "$RUNNER_TEMP/independent-code-scan"
+
+      - name: Upload scan report
+        if: ${{ !cancelled() && (steps.scan.outcome == 'success' || steps.scan.outcome == 'failure') }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: independent-code-scan
+          path: |
+            ${{ runner.temp }}/independent-code-scan/report.md
+            ${{ runner.temp }}/independent-code-scan/findings.json
+          if-no-files-found: error
+          retention-days: 30
